@@ -6,7 +6,7 @@ Metrics per run:
   first_req_ms  latency of that first successful request
   second_req_ms latency of the next request
   started_s     value from the Spring log line "Started/Restored ... in X seconds"
-  rss_mb        resident memory of the listening process after the first request
+  rss_mib       resident memory (MiB) of the listening process after the first request
 """
 import argparse
 import json
@@ -29,7 +29,12 @@ BASE = f"http://127.0.0.1:{PORT}"
 HEAP = ["-Xmx256m"]
 JAR = ["-jar", "app.jar"]
 EXIT_ON_REFRESH = "-Dspring.context.exit=onRefresh"
-STARTED = re.compile(r"(?:Started|Restored) \w+ in ([\d.]+) seconds")
+APP_DIR = "build/app"
+OUT_DIR = "results"
+# (pattern, seconds per unit): a checkpoint taken after refresh restores into a running context
+# and logs a lifecycle restart in milliseconds instead of "Restored ... in X seconds"
+START_LINES = [(re.compile(r"(?:Started|Restored) \w+ in ([\d.]+) seconds"), 1),
+               (re.compile(r"restored JVM running for (\d+) ms"), 0.001)]
 
 
 @dataclass(frozen=True)
@@ -38,7 +43,8 @@ class Trained:
     artifact: str
     train: list
     run: list
-    workload: bool = False   # train on a running service instead of exiting at onRefresh
+    finish: str = "exit"     # how training ends: "exit" at onRefresh, "stop" after a workload,
+                             # "checkpoint" with jcmd JDK.checkpoint after a workload
     restore: bool = False    # measured run restores a checkpoint, no jar on the command line
 
 
@@ -48,16 +54,23 @@ TRAINED = {
     "aot": Trained("app.aot", ["-XX:AOTCacheOutput=app.aot", EXIT_ON_REFRESH],
                    ["-XX:AOTCache=app.aot"]),
     "aot-train": Trained("app-train.aot", ["-XX:AOTCacheOutput=app-train.aot"],
-                         ["-XX:AOTCache=app-train.aot"], workload=True),
+                         ["-XX:AOTCache=app-train.aot"], finish="stop"),
     "crac": Trained("cr", ["-XX:CRaCCheckpointTo=cr", "-Dspring.context.checkpoint=onRefresh"],
                     ["-XX:CRaCRestoreFrom=cr"], restore=True),
+    "crac-warm": Trained("cr-warm", ["-XX:CRaCCheckpointTo=cr-warm"], ["-XX:CRaCRestoreFrom=cr-warm"],
+                         finish="checkpoint", restore=True),
 }
+TRAIN_REQUESTS = 300
 MODES = ["jvm", *TRAINED, "native"]
 
 
-def java_bin():
+def jdk_tool(name):
     home = os.environ.get("JAVA_HOME")
-    return str(Path(home) / "bin" / "java") if home else "java"
+    return str(Path(home) / "bin" / name) if home else name
+
+
+def java_bin():
+    return jdk_tool("java")
 
 
 def port_busy():
@@ -87,7 +100,7 @@ def listening_pid():
     return int(out[0])
 
 
-def rss_mb(pid):
+def rss_mib(pid):
     out = subprocess.run(["ps", "-o", "rss=", "-p", str(pid)],
                          capture_output=True, text=True).stdout.strip()
     return round(int(out) / 1024, 1)
@@ -116,21 +129,27 @@ def kill_launched(proc):
     proc.wait()
 
 
+def wait_port(proc, t0, timeout=90):
+    """Poll every millisecond until the port opens; exit if the process dies or time runs out."""
+    deadline = t0 + timeout
+    wait_until(lambda: port_busy() or proc.poll() is not None or time.perf_counter() > deadline,
+               timeout, step=0.001)
+    if proc.poll() is not None:
+        sys.exit(f"process exited with code {proc.returncode} before answering")
+    if not port_busy():
+        kill_launched(proc)
+        sys.exit(f"no open port within {timeout} s")
+
+
 def wait_ready(proc, t0, timeout=90):
-    """Poll the port every millisecond, then GET; return (ttfr_ms, first_req_ms)."""
+    """Wait for the port, then GET until 200; return (ttfr_ms, first_req_ms)."""
     while True:
-        if proc.poll() is not None:
-            sys.exit(f"process exited with code {proc.returncode} before answering")
-        if time.perf_counter() - t0 > timeout:
-            kill_launched(proc)
-            sys.exit("no answer within timeout")
-        if port_busy():
-            try:
-                first, _ = get()
-                return (time.perf_counter() - t0) * 1000, first
-            except (urllib.error.URLError, ConnectionError, OSError):
-                pass
-        time.sleep(0.001)
+        wait_port(proc, t0, timeout)
+        try:
+            first, _ = get()
+            return (time.perf_counter() - t0) * 1000, first
+        except (urllib.error.URLError, ConnectionError, OSError):
+            time.sleep(0.001)
 
 
 def stop(proc, pid, timeout=20):
@@ -146,6 +165,18 @@ def stop(proc, pid, timeout=20):
     wait_port_free()
 
 
+def checkpoint(proc, log, log_path):
+    """Take a CRaC checkpoint with jcmd; the JVM writes it and exits on its own.
+    If the checkpoint fails (open file or socket) the JVM keeps running and must not hold the port."""
+    done = subprocess.run([jdk_tool("jcmd"), str(listening_pid()), "JDK.checkpoint"],
+                          stdout=log, stderr=subprocess.STDOUT).returncode == 0
+    try:
+        proc.wait(timeout=120 if done else 5)
+    except subprocess.TimeoutExpired:
+        kill_launched(proc)
+        sys.exit(f"JVM did not exit after JDK.checkpoint, see {log_path}")
+
+
 def train(mode, java, app, log_path):
     """Run the training step of a trained mode and check that it produced the artifact."""
     m = TRAINED[mode]
@@ -155,13 +186,16 @@ def train(mode, java, app, log_path):
     wait_port_free()
     with open(log_path, "w") as log:
         proc = launch(cmd, app, log)
-        if m.workload:
-            wait_ready(proc, time.perf_counter())
-            for _ in range(300):
-                get()
-            stop(proc, listening_pid(), timeout=180)
-        else:
+        if m.finish == "exit":
             proc.wait()
+        else:
+            wait_ready(proc, time.perf_counter())
+            for _ in range(TRAIN_REQUESTS):
+                get()
+            if m.finish == "checkpoint":
+                checkpoint(proc, log, log_path)
+            else:
+                stop(proc, listening_pid(), timeout=180)
     if not target.exists() or (target.is_dir() and not any(target.iterdir())):
         sys.exit(f"{mode}: training step (exit code {proc.returncode}) did not produce {m.artifact}, "
                  f"see {log_path}")
@@ -179,6 +213,13 @@ def command(mode, app, native):
     return [java, *m.run] if m.restore else [java, *HEAP, *m.run, *JAR]
 
 
+def started_s(text):
+    for pattern, scale in START_LINES:
+        if found := pattern.search(text):
+            return round(float(found.group(1)) * scale, 3)
+    return None
+
+
 def measure_once(cmd, app, log_path):
     wait_port_free()
     with open(log_path, "w") as log:
@@ -187,23 +228,22 @@ def measure_once(cmd, app, log_path):
         ttfr, first = wait_ready(proc, t0)
         second, _ = get()
         pid = listening_pid()
-        mem = rss_mb(pid)
+        mem = rss_mib(pid)
         info = json.loads(get("/actuator/info")[1])["java"]
         stop(proc, pid)
-    found = STARTED.search(Path(log_path).read_text())
     runtime = f"{info['runtime']['name']} {info['runtime']['version']}, {info['jvm']['name']}"
     return {"ttfr_ms": round(ttfr), "first_req_ms": round(first, 1),
-            "second_req_ms": round(second, 1), "rss_mb": mem,
-            "started_s": float(found.group(1)) if found else None}, runtime
+            "second_req_ms": round(second, 1), "rss_mib": mem,
+            "started_s": started_s(Path(log_path).read_text())}, runtime
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("mode", choices=MODES)
-    ap.add_argument("--app", default="build/app", help="extracted application directory")
+    ap.add_argument("--app", default=APP_DIR, help="extracted application directory")
     ap.add_argument("--native", default="target/app", help="native executable")
     ap.add_argument("--runs", type=int, default=5)
-    ap.add_argument("--out", default="results")
+    ap.add_argument("--out", default=OUT_DIR)
     a = ap.parse_args()
 
     app, native = Path(a.app).resolve(), Path(a.native).resolve()
@@ -211,12 +251,13 @@ def main():
     cmd = command(a.mode, app, native)
     measured = [measure_once(cmd, app, app / "logs" / f"{a.mode}-{i}.log") for i in range(a.runs)]
     runs = [r for r, _ in measured]
-    median = {k: statistics.median(r[k] for r in runs if r[k] is not None)
-              for k in runs[0] if any(r[k] is not None for r in runs)}
-    result = {"mode": a.mode, "runtime": measured[0][1], "runs": a.runs, "median": median, "raw": runs}
+    values = {k: v for k in runs[0] if (v := [r[k] for r in runs if r[k] is not None])}
+    result = {"mode": a.mode, "runtime": measured[0][1], "runs": a.runs, "raw": runs}
+    for name, f in (("median", statistics.median), ("min", min), ("max", max)):
+        result[name] = {k: f(v) for k, v in values.items()}
     Path(a.out).mkdir(exist_ok=True)
     Path(a.out, f"{a.mode}.json").write_text(json.dumps(result, indent=2) + "\n")
-    print(a.mode, json.dumps(median))
+    print(a.mode, json.dumps(result["median"]))
 
 
 if __name__ == "__main__":

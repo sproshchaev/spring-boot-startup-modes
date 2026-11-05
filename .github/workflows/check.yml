@@ -10,7 +10,7 @@ concurrency:
   group: ${{ github.ref }}
   cancel-in-progress: true
 
-# All six modes run on one runner, one after another: comparing medians
+# All seven modes run on one runner, one after another: comparing medians
 # taken on different virtual machines would mix in the spread between them.
 jobs:
   bench:
@@ -42,8 +42,8 @@ jobs:
           sudo chmod u+s "${{ steps.crac.outputs.path }}/lib/criu"
       - name: jvm, cds, aot, aot-train on Temurin
         run: JAVA_HOME="${{ steps.temurin.outputs.path }}" ./run.sh jvm cds aot aot-train
-      - name: crac on Zulu with CRaC
-        run: JAVA_HOME="${{ steps.crac.outputs.path }}" ./run.sh crac
+      - name: crac and crac-warm on Zulu with CRaC
+        run: JAVA_HOME="${{ steps.crac.outputs.path }}" ./run.sh crac crac-warm
       - name: native on GraalVM
         run: JAVA_HOME="$GRAALVM_HOME" ./run.sh native
       - name: Check expected.txt

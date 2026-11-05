@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build the service, prepare each startup mode and measure it.
 # Usage: ./run.sh [modes...]   default: jvm cds aot aot-train
-#   crac   needs a CRaC-enabled JDK (Linux), native needs GraalVM in JAVA_HOME.
+#   crac and crac-warm need a CRaC-enabled JDK (Linux), native needs GraalVM in JAVA_HOME.
 #   RUNS=7 ./run.sh             number of measured runs per mode (default 5)
 #   REQUIRE_ALL=1 ./run.sh ...  fail if a mode from expected.txt was not measured
 set -euo pipefail
@@ -28,6 +28,7 @@ fi
 
 for m in "${MODES[@]}"; do
   python3 bench.py "$m" --runs "$RUNS"
+  [ "$m" = jvm ] && python3 count_classes.py
 done
 
 python3 report.py results ${REQUIRE_ALL:+--require-all}
