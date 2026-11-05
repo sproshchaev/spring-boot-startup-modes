@@ -1,0 +1,54 @@
+name: check
+
+on:
+  push:
+    paths-ignore:
+      - "README.md"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.ref }}
+  cancel-in-progress: true
+
+# All six modes run on one runner, one after another: comparing medians
+# taken on different virtual machines would mix in the spread between them.
+jobs:
+  bench:
+    runs-on: ubuntu-24.04
+    env:
+      RUNS: "7"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        id: temurin
+        with:
+          distribution: temurin
+          java-version: "25"
+          cache: maven
+      - uses: actions/setup-java@v6
+        id: crac
+        with:
+          distribution: zulu
+          java-version: "25"
+          java-package: jdk+crac
+      - uses: graalvm/setup-graalvm@v1
+        id: graalvm
+        with:
+          distribution: graalvm
+          java-version: "25"
+      - name: Allow CRIU to checkpoint and restore
+        run: |
+          sudo chown root:root "${{ steps.crac.outputs.path }}/lib/criu"
+          sudo chmod u+s "${{ steps.crac.outputs.path }}/lib/criu"
+      - name: jvm, cds, aot, aot-train on Temurin
+        run: JAVA_HOME="${{ steps.temurin.outputs.path }}" ./run.sh jvm cds aot aot-train
+      - name: crac on Zulu with CRaC
+        run: JAVA_HOME="${{ steps.crac.outputs.path }}" ./run.sh crac
+      - name: native on GraalVM
+        run: JAVA_HOME="$GRAALVM_HOME" ./run.sh native
+      - name: Check expected.txt
+        run: python3 report.py results --require-all
+      - if: always()
+        run: cat results/summary.md >> "$GITHUB_STEP_SUMMARY" || true
+      - if: failure()
+        run: tail -n 40 build/app/logs/*.log || true

@@ -1,0 +1,89 @@
+# spring-boot-startup-modes
+
+[![check](https://github.com/sproshchaev/spring-boot-startup-modes/actions/workflows/check.yml/badge.svg)](https://github.com/sproshchaev/spring-boot-startup-modes/actions/workflows/check.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
+Эксперимент к статье на Хабре
+«[Spring Boot стартует за три секунды. Сколько из них можно вернуть, не уходя с JVM](https://habr.com/ru/companies/otus/articles/1101900/)».
+
+Один и тот же сервис на Spring Boot 4.1 (web, Spring Data JPA, H2, validation, actuator)
+запускается пятью способами, причём AOT-кэш обучается двумя разными прогонами, так что режимов
+шесть. В каждом замеряется одно и то же:
+
+| Режим | Как запускается |
+|---|---|
+| `jvm` | `java -jar app.jar` из распакованного jar |
+| `cds` | архив классов CDS после обучающего запуска до `onRefresh` |
+| `aot` | AOT-кэш Leyden (JEP 483, 514, 515) после обучающего запуска до `onRefresh` |
+| `aot-train` | AOT-кэш, обученный на работающем сервисе: 300 запросов, затем штатная остановка |
+| `crac` | снимок процесса CRaC на `onRefresh` и восстановление из него |
+| `native` | образ GraalVM Native Image |
+
+## Запуск
+
+Нужны JDK 25, Maven, Python 3 и `lsof`. Порт 8080 должен быть свободен.
+
+```bash
+git clone https://github.com/sproshchaev/spring-boot-startup-modes.git
+cd spring-boot-startup-modes
+./run.sh                 # jvm cds aot aot-train
+./run.sh native          # JAVA_HOME указывает на GraalVM 25
+./run.sh crac            # JAVA_HOME указывает на JDK с CRaC, только Linux
+```
+
+`run.sh` собирает сервис, распаковывает jar, делает обучающий запуск или снимок для каждого
+режима, затем запускает его `RUNS` раз (по умолчанию 5) и берёт медиану. Итог пишется в
+`results/summary.md` и сверяется с `expected.txt`. В эталоне только порядок режимов, а не
+миллисекунды: абсолютные цифры зависят от машины. При нарушении порядка код выхода 1.
+
+Полный прогон всех шести режимов идёт в CI на `ubuntu-24.04`: Temurin 25 для `jvm`, `cds`,
+`aot`, `aot-train`, Zulu 25 с CRaC для `crac`, GraalVM 25 для `native`. Таблица прогона
+выводится в сводку задания `report`.
+
+## Что замеряется
+
+| Метрика | Что это |
+|---|---|
+| до первого 200, мс | от запуска процесса до первого ответа 200 на `GET /products` |
+| Started, с | цифра из строки лога `Started …` или `Restored …` |
+| 1-й запрос, мс | сколько шёл этот первый успешный запрос |
+| 2-й запрос, мс | следующий запрос сразу за ним |
+| RSS, МБ | резидентная память слушающего порт процесса после первого запроса |
+
+## Результат
+
+Будет заполнено по прогону CI.
+
+## Границы применимости
+
+- Сервис маленький: одна сущность, один репозиторий, один контроллер. У сервиса с сотней бинов
+  абсолютные цифры другие, а порядок режимов, скорее всего, тот же.
+- Замер холодного старта на одной машине. Прогрев до пиковой производительности
+  (throughput через минуту работы) здесь не меряется.
+- RSS не делит память, общую с другими процессами. Архив CDS и AOT-кэш отображаются в память
+  и учитываются в RSS целиком, хотя несколько экземпляров на одной машине делят их страницы.
+- Снимок CRaC содержит память процесса, включая всё, что было в ней на момент снимка. Секреты
+  в снимок попадать не должны.
+
+## Структура
+
+```text
+src/main/java/demo/   сервис: сущность Product, репозиторий, контроллер
+src/main/resources/   настройки и data.sql с пятью товарами
+bench.py              подготовка режима и замер N запусков
+report.py             сводная таблица и проверка expected.txt
+run.sh                сборка и прогон выбранных режимов
+expected.txt          ожидаемый порядок режимов
+.github/workflows/    CI: три задания по JDK и итоговая сверка
+```
+
+## Источники
+
+- JEP 483: Ahead-of-Time Class Loading & Linking — https://openjdk.org/jeps/483
+- JEP 514: Ahead-of-Time Command-Line Ergonomics — https://openjdk.org/jeps/514
+- JEP 515: Ahead-of-Time Method Profiling — https://openjdk.org/jeps/515
+- Spring Boot, AOT Cache и CDS — https://docs.spring.io/spring-boot/reference/packaging/aot-cache.html
+
+## Лицензия
+
+MIT, см. [LICENSE](LICENSE).
