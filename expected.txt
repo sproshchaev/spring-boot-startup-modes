@@ -4,5 +4,6 @@ cds.ttfr_ms < jvm.ttfr_ms
 aot.ttfr_ms < jvm.ttfr_ms
 aot.ttfr_ms < cds.ttfr_ms
 crac.ttfr_ms < aot.ttfr_ms
+crac-warm.first_req_ms < crac.first_req_ms
 native.ttfr_ms < aot.ttfr_ms
 native.rss_mib < jvm.rss_mib

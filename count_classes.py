@@ -13,7 +13,7 @@ import re
 import time
 from pathlib import Path
 
-from bench import (APP_DIR, HEAP, JAR, OUT_DIR, get, java_bin, kill_launched, launch, listening_pid,
+from bench import (APP_DIR, HEAP, JAR, OUT_DIR, READY_TIMEOUT, get, java_bin, kill_launched, launch, listening_pid,
                    stop, wait_port, wait_port_free)
 
 LOAD = re.compile(r"\[class,load\] (\S+) source:")
@@ -32,7 +32,7 @@ def main():
     with open(app / "logs" / "count-classes.log", "w") as out:
         proc = launch([java_bin(), *HEAP, f"-Xlog:class+load:file={log}", *JAR], app, out)
         try:
-            wait_port(proc, time.perf_counter())
+            wait_port(proc, time.perf_counter() + READY_TIMEOUT)
             points = {"ready": snapshot(log)}
             get()
             points["first"] = snapshot(log)

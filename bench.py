@@ -9,6 +9,7 @@ Metrics per run:
   rss_mib       resident memory (MiB) of the listening process after the first request
 """
 import argparse
+import http.client
 import json
 import os
 import re
@@ -19,7 +20,6 @@ import statistics
 import subprocess
 import sys
 import time
-import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -48,6 +48,11 @@ class Trained:
     restore: bool = False    # measured run restores a checkpoint, no jar on the command line
 
 
+# CRaC engine and the line it logs once the checkpoint image is on disk. warp needs no root rights,
+# unlike CRIU; set explicitly so both CRaC modes use the same engine
+CRAC_ENGINE, CHECKPOINT_DONE = "-XX:CRaCEngine=warp", "warp: Checkpoint successful!"
+# timeouts, seconds
+READY_TIMEOUT, STOP_TIMEOUT, TRAIN_TIMEOUT, CHECKPOINT_WRITE_TIMEOUT = 90, 20, 180, 120
 TRAINED = {
     "cds": Trained("app.jsa", ["-XX:ArchiveClassesAtExit=app.jsa", EXIT_ON_REFRESH],
                    ["-XX:SharedArchiveFile=app.jsa"]),
@@ -55,10 +60,10 @@ TRAINED = {
                    ["-XX:AOTCache=app.aot"]),
     "aot-train": Trained("app-train.aot", ["-XX:AOTCacheOutput=app-train.aot"],
                          ["-XX:AOTCache=app-train.aot"], finish="stop"),
-    "crac": Trained("cr", ["-XX:CRaCCheckpointTo=cr", "-Dspring.context.checkpoint=onRefresh"],
-                    ["-XX:CRaCRestoreFrom=cr"], restore=True),
-    "crac-warm": Trained("cr-warm", ["-XX:CRaCCheckpointTo=cr-warm"], ["-XX:CRaCRestoreFrom=cr-warm"],
-                         finish="checkpoint", restore=True),
+    "crac": Trained("cr", [CRAC_ENGINE, "-XX:CRaCCheckpointTo=cr", "-Dspring.context.checkpoint=onRefresh"],
+                    [CRAC_ENGINE, "-XX:CRaCRestoreFrom=cr"], restore=True),
+    "crac-warm": Trained("cr-warm", [CRAC_ENGINE, "-XX:CRaCCheckpointTo=cr-warm"],
+                         [CRAC_ENGINE, "-XX:CRaCRestoreFrom=cr-warm"], finish="checkpoint", restore=True),
 }
 TRAIN_REQUESTS = 300
 MODES = ["jvm", *TRAINED, "native"]
@@ -129,52 +134,74 @@ def kill_launched(proc):
     proc.wait()
 
 
-def wait_port(proc, t0, timeout=90):
-    """Poll every millisecond until the port opens; exit if the process dies or time runs out."""
-    deadline = t0 + timeout
+def abort(proc, message):
+    kill_launched(proc)
+    sys.exit(message)
+
+
+def wait_or_kill(proc, timeout):
+    """Wait for the launched process to exit; kill its group and return False on timeout."""
+    try:
+        proc.wait(timeout=timeout)
+        return True
+    except subprocess.TimeoutExpired:
+        kill_launched(proc)
+        return False
+
+
+def wait_port(proc, deadline):
+    """Poll every millisecond until the port opens; exit if the process dies or the deadline passes."""
     wait_until(lambda: port_busy() or proc.poll() is not None or time.perf_counter() > deadline,
-               timeout, step=0.001)
+               READY_TIMEOUT, step=0.001)
     if proc.poll() is not None:
         sys.exit(f"process exited with code {proc.returncode} before answering")
     if not port_busy():
-        kill_launched(proc)
-        sys.exit(f"no open port within {timeout} s")
+        abort(proc, f"no open port within {READY_TIMEOUT} s")
 
 
-def wait_ready(proc, t0, timeout=90):
+def wait_ready(proc, t0):
     """Wait for the port, then GET until 200; return (ttfr_ms, first_req_ms)."""
+    deadline, first_error = t0 + READY_TIMEOUT, None
     while True:
-        wait_port(proc, t0, timeout)
+        wait_port(proc, deadline)
         try:
             first, _ = get()
             return (time.perf_counter() - t0) * 1000, first
-        except (urllib.error.URLError, ConnectionError, OSError):
-            time.sleep(0.001)
+        except (http.client.HTTPException, OSError) as e:
+            now = time.perf_counter()
+            if now > deadline:
+                abort(proc, f"no HTTP 200 within {READY_TIMEOUT} s, last error: {e}")
+            # keep the 1 ms pace for a short race right after the port opens, then back off
+            first_error = first_error or now
+            time.sleep(0.001 if now - first_error < 0.5 else 0.05)
 
 
-def stop(proc, pid, timeout=20):
+def stop(proc, pid, timeout=STOP_TIMEOUT):
     """Stop the server that listens on the port; after a CRaC restore it is not `proc` itself."""
     os.kill(pid, signal.SIGTERM)
-    if not wait_until(lambda: not port_busy(), timeout):
+    if not wait_until(lambda: not port_busy(), STOP_TIMEOUT):
         os.kill(pid, signal.SIGKILL)
-    try:
-        # with -XX:AOTCacheOutput the launched JVM still assembles the cache after the server is gone
-        proc.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        kill_launched(proc)
+    # with -XX:AOTCacheOutput the launched JVM still assembles the cache after the server is gone
+    wait_or_kill(proc, timeout)
     wait_port_free()
 
 
-def checkpoint(proc, log, log_path):
-    """Take a CRaC checkpoint with jcmd; the JVM writes it and exits on its own.
-    If the checkpoint fails (open file or socket) the JVM keeps running and must not hold the port."""
-    done = subprocess.run([jdk_tool("jcmd"), str(listening_pid()), "JDK.checkpoint"],
-                          stdout=log, stderr=subprocess.STDOUT).returncode == 0
+def jcmd_checkpoint(proc, log):
     try:
-        proc.wait(timeout=120 if done else 5)
+        ok = subprocess.run([jdk_tool("jcmd"), str(listening_pid()), "JDK.checkpoint"],
+                            stdout=log, stderr=subprocess.STDOUT, timeout=TRAIN_TIMEOUT).returncode == 0
     except subprocess.TimeoutExpired:
-        kill_launched(proc)
-        sys.exit(f"JVM did not exit after JDK.checkpoint, see {log_path}")
+        ok = False
+    if not ok:
+        abort(proc, f"jcmd JDK.checkpoint failed, see {log.name}")
+
+
+def wait_checkpoint_written(proc, log_path):
+    """jcmd returns before the image is written, and the open port says nothing about it. The JVM
+    either exits after the checkpoint or keeps serving, so wait for the exit or the engine's line."""
+    return wait_until(lambda: proc.poll() is not None
+                      or CHECKPOINT_DONE in Path(log_path).read_text(errors="replace"),
+                      CHECKPOINT_WRITE_TIMEOUT, step=0.5)
 
 
 def train(mode, java, app, log_path):
@@ -187,18 +214,23 @@ def train(mode, java, app, log_path):
     with open(log_path, "w") as log:
         proc = launch(cmd, app, log)
         if m.finish == "exit":
-            proc.wait()
+            if not wait_or_kill(proc, TRAIN_TIMEOUT):
+                sys.exit(f"{mode}: training run did not exit within {TRAIN_TIMEOUT} s, see {log_path}")
         else:
             wait_ready(proc, time.perf_counter())
             for _ in range(TRAIN_REQUESTS):
                 get()
             if m.finish == "checkpoint":
-                checkpoint(proc, log, log_path)
+                jcmd_checkpoint(proc, log)
             else:
-                stop(proc, listening_pid(), timeout=180)
+                stop(proc, listening_pid(), timeout=TRAIN_TIMEOUT)
+        if m.restore and not wait_checkpoint_written(proc, log_path):
+            abort(proc, f"{mode}: no '{CHECKPOINT_DONE}' within {CHECKPOINT_WRITE_TIMEOUT} s, see {log_path}")
+        # after a checkpoint the JVM may keep serving; for an exited process this is a no-op
+        kill_launched(proc)
+    wait_port_free()
     if not target.exists() or (target.is_dir() and not any(target.iterdir())):
-        sys.exit(f"{mode}: training step (exit code {proc.returncode}) did not produce {m.artifact}, "
-                 f"see {log_path}")
+        sys.exit(f"{mode}: training step did not produce {m.artifact}, see {log_path}")
 
 
 def command(mode, app, native):
@@ -253,7 +285,7 @@ def main():
     runs = [r for r, _ in measured]
     values = {k: v for k in runs[0] if (v := [r[k] for r in runs if r[k] is not None])}
     result = {"mode": a.mode, "runtime": measured[0][1], "runs": a.runs, "raw": runs}
-    for name, f in (("median", statistics.median), ("min", min), ("max", max)):
+    for name, f in (("median", lambda v: round(statistics.median(v), 3)), ("min", min), ("max", max)):
         result[name] = {k: f(v) for k, v in values.items()}
     Path(a.out).mkdir(exist_ok=True)
     Path(a.out, f"{a.mode}.json").write_text(json.dumps(result, indent=2) + "\n")

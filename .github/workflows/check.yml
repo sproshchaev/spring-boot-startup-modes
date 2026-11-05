@@ -15,6 +15,8 @@ concurrency:
 jobs:
   bench:
     runs-on: ubuntu-24.04
+    # a hung mode fails the job instead of holding the runner for the default 6 hours
+    timeout-minutes: 30
     env:
       RUNS: "7"
     steps:
@@ -36,10 +38,6 @@ jobs:
         with:
           distribution: graalvm
           java-version: "25"
-      - name: Allow CRIU to checkpoint and restore
-        run: |
-          sudo chown root:root "${{ steps.crac.outputs.path }}/lib/criu"
-          sudo chmod u+s "${{ steps.crac.outputs.path }}/lib/criu"
       - name: jvm, cds, aot, aot-train on Temurin
         run: JAVA_HOME="${{ steps.temurin.outputs.path }}" ./run.sh jvm cds aot aot-train
       - name: crac and crac-warm on Zulu with CRaC
