@@ -47,9 +47,28 @@
         <dependency>
             <groupId>org.crac</groupId>
             <artifactId>crac</artifactId>
-            <version>1.5.0</version>
         </dependency>
     </dependencies>
+
+    <profiles>
+        <!--
+            Adds to the native profile of spring-boot-starter-parent: keeps org.crac off the runtime
+            classpath of the native image. With org.crac present Spring Boot registers a Hikari
+            checkpoint lifecycle that reads pool internals by reflection and fails at native startup.
+            After a -Pnative build target/app.jar has no org.crac either: run.sh extracts the jar for
+            the JVM modes before the native build.
+        -->
+        <profile>
+            <id>native</id>
+            <dependencies>
+                <dependency>
+                    <groupId>org.crac</groupId>
+                    <artifactId>crac</artifactId>
+                    <scope>test</scope>
+                </dependency>
+            </dependencies>
+        </profile>
+    </profiles>
 
     <build>
         <finalName>app</finalName>
