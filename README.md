@@ -3,6 +3,14 @@
 [![check](https://github.com/sproshchaev/spring-boot-startup-modes/actions/workflows/check.yml/badge.svg)](https://github.com/sproshchaev/spring-boot-startup-modes/actions/workflows/check.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
+**Сергей Прощаев**
+
+[![Website](https://img.shields.io/badge/prosoft.pages.dev-blue?logo=googlechrome&logoColor=white)](https://prosoft.pages.dev)
+[![LinkedIn](https://img.shields.io/badge/LinkedIn-sproshchaev-0A66C2)](https://www.linkedin.com/in/sproshchaev/)
+[![Habr](https://img.shields.io/badge/Habr-sproshchaev-65A3BE?logo=habr&logoColor=white)](https://habr.com/ru/users/sproshchaev/)
+
+---
+
 Эксперимент к статье на Хабре
 «[Spring Boot стартует за три секунды. Сколько из них можно вернуть, не уходя с JVM](https://habr.com/ru/companies/otus/articles/1101900/)».
 
